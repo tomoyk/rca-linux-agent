@@ -11,19 +11,34 @@ import psutil
 class _SSHClient:
     """Helper for running commands on a remote machine via SSH."""
 
-    def __init__(self, host: str, user: str, password: str | None = None, key: str | None = None):
+    def __init__(
+        self,
+        host: str,
+        user: str,
+        *,
+        password: str | None = None,
+        key: str | None = None,
+        port: int = 22,
+    ):
         self.host = host
         self.user = user
         self.password = password
         self.key = key
+        self.port = port
         self.client = paramiko.SSHClient()
         self.client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
 
     def __enter__(self):
+        connect_kwargs = {
+            "hostname": self.host,
+            "port": self.port,
+            "username": self.user,
+        }
         if self.key:
-            self.client.connect(self.host, username=self.user, key_filename=self.key)
+            connect_kwargs["key_filename"] = self.key
         else:
-            self.client.connect(self.host, username=self.user, password=self.password)
+            connect_kwargs["password"] = self.password
+        self.client.connect(**connect_kwargs)
         return self
 
     def run(self, cmd: str) -> str:
@@ -179,8 +194,9 @@ class RCALinuxAgent(BaseAgent):
             user = os.environ.get('RCA_REMOTE_USER', 'root')
             password = os.environ.get('RCA_REMOTE_PASSWORD')
             key = os.environ.get('RCA_REMOTE_KEY')
+            port = int(os.environ.get('RCA_REMOTE_PORT', '22'))
 
-            with _SSHClient(host, user, password=password, key=key) as client:
+            with _SSHClient(host, user, password=password, key=key, port=port) as client:
                 metrics = collect_metrics(client)
         else:
             metrics = collect_local_metrics()

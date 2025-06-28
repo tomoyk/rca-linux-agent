@@ -21,6 +21,7 @@ failed `systemd` services.
    * `RCA_REMOTE_USER` - SSH username
    * `RCA_REMOTE_PASSWORD` - SSH password (optional when using a key)
    * `RCA_REMOTE_KEY` - path to a private key file (optional)
+   * `RCA_REMOTE_PORT` - SSH port (defaults to 22)
 
 3. Execute the agent:
 

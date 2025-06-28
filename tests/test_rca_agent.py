@@ -41,8 +41,9 @@ class LXCRemoteMetricsTest(unittest.TestCase):
         env.update({
             'RCA_REMOTE_HOST': ip,
             'RCA_REMOTE_USER': 'root',
+            'RCA_REMOTE_PORT': '22',
         })
-        with _SSHClient(ip, 'root') as client:
+        with _SSHClient(ip, 'root', port=22) as client:
             metrics = collect_metrics(client)
         self.assertIn('memory_usage_percent', metrics)
 
