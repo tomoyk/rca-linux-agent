@@ -136,14 +136,35 @@ def _get_key_content(key: Optional[str]) -> Optional[str]:
     return key
 
 
+def _parse_ssh_config(host: str):
+    config_path = os.environ.get("SSH_CONFIG")
+    if not config_path or not os.path.exists(config_path):
+        return {}
+    ssh_config = paramiko.SSHConfig()
+    with open(config_path) as f:
+        ssh_config.parse(f)
+    cfg = ssh_config.lookup(host)
+    return {
+        "hostname": cfg.get("hostname", host),
+        "user": cfg.get("user"),
+        "port": int(cfg["port"]) if "port" in cfg else None,
+        "key_filename": cfg.get("identityfile", [None])[0],
+    }
+
+
 def collect_remote_metrics(
     host: str,
-    user: str,
+    user: Optional[str] = None,
     password: Optional[str] = None,
     key: Optional[str] = None,
-    port: int = 22,
+    port: Optional[int] = None,
 ) -> Dict[str, object]:
     """リモートマシンの主要メトリクスとsystemdサービス情報を収集。"""
+    ssh_cfg = _parse_ssh_config(host)
+    host = ssh_cfg.get("hostname", host)
+    user = user or ssh_cfg.get("user") or "root"
+    key = key or ssh_cfg.get("key_filename")
+    port = port or ssh_cfg.get("port") or 22
     key_content = _get_key_content(key)
     with _SSHClient(
         host, user, password=password, key=key_content, port=port
