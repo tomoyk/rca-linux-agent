@@ -4,7 +4,8 @@ This repository provides a simple Root Cause Analysis (RCA) agent built using th
 [Google Agent Development Kit (ADK)](https://google.github.io/adk-docs/). The
 agent collects basic system metrics from a Linux machine including memory usage,
 CPU usage, disk usage, inode usage, file descriptor usage and the status of
-failed `systemd` services.
+failed `systemd` services. It also lists the top CPU-consuming processes and
+provides a short analysis with possible reasons for high CPU usage.
 
 ## Running the Agent
 

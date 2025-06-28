@@ -98,6 +98,19 @@ def _service_logs(service: str) -> List[str]:
         return []
 
 
+def _top_processes(count: int = 5) -> List[str]:
+    """Return a list of the top CPU-consuming local processes."""
+    try:
+        output = subprocess.check_output(
+            ['ps', '-eo', 'pid,comm,%cpu', '--sort=-%cpu'],
+            text=True,
+        )
+        lines = output.strip().splitlines()[1:count + 1]
+        return [line.strip() for line in lines]
+    except Exception:
+        return []
+
+
 def _remote_memory_usage(client: _SSHClient) -> float:
     out = client.run("free | awk '/Mem:/ {print ($3/$2)*100}'")
     try:
@@ -151,6 +164,14 @@ def _remote_service_logs(client: _SSHClient, service: str) -> List[str]:
     return out.strip().splitlines()
 
 
+def _remote_top_processes(client: _SSHClient, count: int = 5) -> List[str]:
+    """Return a list of the top CPU-consuming processes."""
+    cmd = f"ps -eo pid,comm,%cpu --sort=-%cpu | head -n {count + 1}"
+    out = client.run(cmd)
+    lines = out.strip().splitlines()[1:]
+    return [line.strip() for line in lines]
+
+
 def collect_metrics(client: _SSHClient) -> Dict[str, object]:
     failed = _remote_failed_services(client)
     logs = {srv: _remote_service_logs(client, srv) for srv in failed}
@@ -162,6 +183,7 @@ def collect_metrics(client: _SSHClient) -> Dict[str, object]:
         'fd_usage_percent': _remote_fd_usage(client),
         'failed_systemd_services': failed,
         'systemd_logs': logs,
+        'top_cpu_processes': _remote_top_processes(client),
     }
 
 
@@ -177,7 +199,34 @@ def collect_local_metrics() -> Dict[str, object]:
         'fd_usage_percent': _fd_usage(),
         'failed_systemd_services': failed,
         'systemd_logs': logs,
+        'top_cpu_processes': _top_processes(),
     }
+
+
+def analyze_metrics(metrics: Dict[str, object]) -> List[str]:
+    """Return human-readable analysis of the metrics."""
+    reasons: List[str] = []
+    cpu = metrics.get('cpu_usage_percent', 0.0)
+    memory = metrics.get('memory_usage_percent', 0.0)
+    if cpu > 80:
+        procs = metrics.get('top_cpu_processes', [])
+        if procs:
+            reasons.append(
+                f"High CPU usage detected ({cpu:.1f}%). Top processes: "
+                + ", ".join(procs)
+            )
+        else:
+            reasons.append(f"High CPU usage detected ({cpu:.1f}%).")
+    if memory > 90:
+        reasons.append(
+            f"Memory usage is high ({memory:.1f}%). This may lead to increased CPU usage due to swapping."
+        )
+    if metrics.get('failed_systemd_services'):
+        services = ", ".join(metrics['failed_systemd_services'])
+        reasons.append(f"Failed systemd services detected: {services}.")
+    if not reasons:
+        reasons.append("No immediate issues detected.")
+    return reasons
 
 
 class RCALinuxAgent(BaseAgent):
@@ -200,7 +249,12 @@ class RCALinuxAgent(BaseAgent):
                 metrics = collect_metrics(client)
         else:
             metrics = collect_local_metrics()
-        text = json.dumps(metrics, indent=2)
+        analysis = analyze_metrics(metrics)
+        result = {
+            'metrics': metrics,
+            'analysis': analysis,
+        }
+        text = json.dumps(result, indent=2)
         yield Event(
             invocation_id=ctx.invocation_id,
             author=self.name,
