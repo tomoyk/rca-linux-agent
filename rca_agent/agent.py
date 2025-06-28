@@ -1,23 +1,40 @@
-import json
 import os
+import json
 import resource
 import subprocess
-from typing import AsyncGenerator, Dict, List
+import tempfile
+from typing import AsyncGenerator, Dict, List, Optional
 
 import paramiko
 import psutil
+from google.adk.agents import Agent, BaseAgent
+from google.adk.agents.invocation_context import InvocationContext
+from google.adk.events.event import Event
+from google.genai import types
+
+
+def _get_key_params(key: Optional[str]):
+    """keyがファイルパスならそのまま、内容なら一時ファイルに書き出してkey_filenameに渡す。"""
+    if key and os.path.exists(key):
+        return {"key_filename": key}
+    elif key:
+        tmp = tempfile.NamedTemporaryFile(delete=False)
+        tmp.write(key.encode())
+        tmp.close()
+        return {"key_filename": tmp.name}
+    else:
+        return {}
 
 
 class _SSHClient:
-    """Helper for running commands on a remote machine via SSH."""
+    """SSH経由でリモートコマンドを実行するヘルパークラス。"""
 
     def __init__(
         self,
         host: str,
         user: str,
-        *,
-        password: str | None = None,
-        key: str | None = None,
+        password: Optional[str] = None,
+        key: Optional[str] = None,
         port: int = 22,
     ):
         self.host = host
@@ -35,8 +52,9 @@ class _SSHClient:
             "username": self.user,
         }
         if self.key:
-            connect_kwargs["key_filename"] = self.key
-        else:
+            key_params = _get_key_params(self.key)
+            connect_kwargs.update(key_params)
+        elif self.password:
             connect_kwargs["password"] = self.password
         self.client.connect(**connect_kwargs)
         return self
@@ -47,92 +65,47 @@ class _SSHClient:
 
     def __exit__(self, exc_type, exc, tb):
         self.client.close()
-from google.adk.agents.base_agent import BaseAgent
-from google.adk.agents.invocation_context import InvocationContext
-from google.adk.events.event import Event
-from google.genai import types
 
 
-def _inode_usage(path: str) -> float:
+def _remote_metric(client: _SSHClient, cmd: str, postproc=lambda x: x) -> float:
+    """リモートでコマンド実行し、floatで返す。"""
+    out = client.run(cmd)
     try:
-        stats = os.statvfs(path)
-        if stats.f_files == 0:
-            return 0.0
-        used = stats.f_files - stats.f_favail
-        return 100.0 * used / stats.f_files
+        return float(postproc(out.strip()))
     except Exception:
         return 0.0
-
-
-def _fd_usage() -> float:
-    try:
-        soft_limit, _ = resource.getrlimit(resource.RLIMIT_NOFILE)
-        used = len(os.listdir('/proc/self/fd'))
-        return 100.0 * used / soft_limit if soft_limit else 0.0
-    except Exception:
-        return 0.0
-
-
-def _failed_services() -> list[str]:
-    try:
-        output = subprocess.check_output(
-            ['systemctl', '--failed', '--no-legend', '--plain'],
-            text=True,
-            stderr=subprocess.STDOUT,
-        )
-        return [line.split()[0] for line in output.strip().splitlines() if line]
-    except Exception as exc:
-        return [f'error: {exc}']
-
-
-def _service_logs(service: str) -> List[str]:
-    """Return the last few lines of a systemd service's log."""
-    try:
-        output = subprocess.check_output(
-            ['journalctl', '-u', service, '--no-pager', '-n', '20'],
-            text=True,
-            stderr=subprocess.STDOUT,
-        )
-        return output.strip().splitlines()
-    except Exception:
-        return []
 
 
 def _remote_memory_usage(client: _SSHClient) -> float:
-    out = client.run("free | awk '/Mem:/ {print ($3/$2)*100}'")
-    try:
-        return float(out.strip())
-    except Exception:
-        return 0.0
+    return _remote_metric(client, "free | awk '/Mem:/ {print ($3/$2)*100}'")
+
+
+# def _remote_memory_usage_details(client: _SSHClient) -> Dict[str, float]:
+#     out = client.run("free -h")
+#     lines = out.strip().splitlines()
+#     headers = lines[0].split()
+#     values = lines[1].split()
+#     return {header: float(value) for header, value in zip(headers, values)}
 
 
 def _remote_cpu_usage(client: _SSHClient) -> float:
-    cmd = "top -bn1 | grep 'Cpu(s)' | awk '{print 100 - $8}'"
-    out = client.run(cmd)
-    try:
-        return float(out.strip())
-    except Exception:
-        return 0.0
+    return _remote_metric(client, "top -bn1 | grep 'Cpu(s)' | awk '{print 100 - $8}'")
 
 
 def _remote_disk_usage(client: _SSHClient) -> float:
-    out = client.run("df -P / | tail -1 | awk '{print $5}'")
-    try:
-        return float(out.strip().strip('%'))
-    except Exception:
-        return 0.0
+    return _remote_metric(
+        client, "df -P / | tail -1 | awk '{print $5}'", lambda x: x.strip("%")
+    )
 
 
 def _remote_inode_usage(client: _SSHClient) -> float:
-    out = client.run("df -Pi / | tail -1 | awk '{print $5}'")
-    try:
-        return float(out.strip().strip('%'))
-    except Exception:
-        return 0.0
+    return _remote_metric(
+        client, "df -Pi / | tail -1 | awk '{print $5}'", lambda x: x.strip("%")
+    )
 
 
 def _remote_fd_usage(client: _SSHClient) -> float:
-    out = client.run('cat /proc/sys/fs/file-nr')
+    out = client.run("cat /proc/sys/fs/file-nr")
     try:
         alloc, _, max_files = [float(x) for x in out.split()[:3]]
         return (alloc / max_files) * 100 if max_files > 0 else 0.0
@@ -141,65 +114,71 @@ def _remote_fd_usage(client: _SSHClient) -> float:
 
 
 def _remote_failed_services(client: _SSHClient) -> List[str]:
-    out = client.run('systemctl --failed --no-legend --plain')
-    services = [line.split()[0] for line in out.strip().splitlines() if line]
-    return services
+    out = client.run("systemctl --failed --no-legend --plain --no-pager")
+    return [line.split()[0] for line in out.strip().splitlines() if line]
+
+
+def _remote_services(client: _SSHClient) -> list:
+    out = client.run("systemctl list-units --type=service --no-pager --no-legend")
+    return [line.split()[0] for line in out.strip().splitlines() if line]
 
 
 def _remote_service_logs(client: _SSHClient, service: str) -> List[str]:
-    out = client.run(f'journalctl -u {service} --no-pager -n 20 2>/dev/null')
+    out = client.run(f"journalctl -u {service} --no-pager -n 20 2>/dev/null")
     return out.strip().splitlines()
 
 
-def collect_metrics(client: _SSHClient) -> Dict[str, object]:
-    failed = _remote_failed_services(client)
-    logs = {srv: _remote_service_logs(client, srv) for srv in failed}
-    return {
-        'memory_usage_percent': _remote_memory_usage(client),
-        'cpu_usage_percent': _remote_cpu_usage(client),
-        'disk_usage_percent': _remote_disk_usage(client),
-        'inode_usage_percent': _remote_inode_usage(client),
-        'fd_usage_percent': _remote_fd_usage(client),
-        'failed_systemd_services': failed,
-        'systemd_logs': logs,
-    }
+def _get_key_content(key: Optional[str]) -> Optional[str]:
+    """keyがファイルパスなら内容を返し、内容ならそのまま返す。"""
+    if key and os.path.exists(key):
+        with open(key) as f:
+            return f.read()
+    return key
 
 
-def collect_local_metrics() -> Dict[str, object]:
-    """Collect metrics from the local machine."""
-    failed = _failed_services()
-    logs = {srv: _service_logs(srv) for srv in failed}
-    return {
-        'memory_usage_percent': psutil.virtual_memory().percent,
-        'cpu_usage_percent': psutil.cpu_percent(interval=0.1),
-        'disk_usage_percent': psutil.disk_usage('/').percent,
-        'inode_usage_percent': _inode_usage('/'),
-        'fd_usage_percent': _fd_usage(),
-        'failed_systemd_services': failed,
-        'systemd_logs': logs,
-    }
+def collect_remote_metrics(
+    host: str,
+    user: str,
+    password: Optional[str] = None,
+    key: Optional[str] = None,
+    port: int = 22,
+) -> Dict[str, object]:
+    """リモートマシンの主要メトリクスとsystemdサービス情報を収集。"""
+    key_content = _get_key_content(key)
+    with _SSHClient(
+        host, user, password=password, key=key_content, port=port
+    ) as client:
+        failed = _remote_failed_services(client)
+        logs = {srv: _remote_service_logs(client, srv) for srv in failed}
+        services = _remote_services(client)
+        return {
+            "memory_usage_percent": _remote_memory_usage(client),
+            "cpu_usage_percent": _remote_cpu_usage(client),
+            "disk_usage_percent": _remote_disk_usage(client),
+            "inode_usage_percent": _remote_inode_usage(client),
+            "fd_usage_percent": _remote_fd_usage(client),
+            "failed_systemd_services": failed,
+            "services": services,
+            "systemd_logs": logs,
+        }
 
 
 class RCALinuxAgent(BaseAgent):
-    """Simple agent to gather Linux metrics."""
+    """リモート/ローカルのLinuxメトリクスを収集するRCAエージェント。"""
 
-    name: str = 'rca_agent'
-    description: str = 'Collect system metrics for RCA'
+    name: str = "rca_agent"
+    description: str = "Collect system metrics for RCA"
 
     async def _run_async_impl(
         self, ctx: InvocationContext
     ) -> AsyncGenerator[Event, None]:
-        host = os.environ.get('RCA_REMOTE_HOST')
-        if host:
-            user = os.environ.get('RCA_REMOTE_USER', 'root')
-            password = os.environ.get('RCA_REMOTE_PASSWORD')
-            key = os.environ.get('RCA_REMOTE_KEY')
-            port = int(os.environ.get('RCA_REMOTE_PORT', '22'))
+        host = os.environ.get("RCA_REMOTE_HOST", "127.0.0.1")
+        user = os.environ.get("RCA_REMOTE_USER", "root")
+        password = os.environ.get("RCA_REMOTE_PASSWORD")
+        key = os.environ.get("RCA_REMOTE_KEY")
+        port = int(os.environ.get("RCA_REMOTE_PORT", "22"))
+        metrics = collect_remote_metrics(host, user, password, key, port)
 
-            with _SSHClient(host, user, password=password, key=key, port=port) as client:
-                metrics = collect_metrics(client)
-        else:
-            metrics = collect_local_metrics()
         text = json.dumps(metrics, indent=2)
         yield Event(
             invocation_id=ctx.invocation_id,
@@ -209,4 +188,10 @@ class RCALinuxAgent(BaseAgent):
         )
 
 
-root_agent = RCALinuxAgent()
+root_agent = Agent(
+    name="rca_agent",
+    model="gemini-2.0-flash",
+    description="Collect and explain system metrics, including CPU usage, disk, and systemd services (all and failed).",
+    instruction="You can ask about CPU, disk, and systemd service status (all or failed).",
+    tools=[collect_remote_metrics],
+)
