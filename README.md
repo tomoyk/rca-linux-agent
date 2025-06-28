@@ -11,14 +11,22 @@ failed `systemd` services.
 1. Install the required dependencies:
 
    ```bash
-   pip install google-adk psutil
+   pip install google-adk psutil paramiko
    ```
 
-2. Execute the agent:
+2. Set environment variables with the SSH connection information:
+
+   * `RCA_REMOTE_HOST` - hostname or IP address of the target machine
+   * `RCA_REMOTE_USER` - SSH username
+   * `RCA_REMOTE_PASSWORD` - SSH password (optional when using a key)
+   * `RCA_REMOTE_KEY` - path to a private key file (optional)
+
+3. Execute the agent:
 
    ```bash
    python run_rca_agent.py
    ```
 
-The script runs a minimal ADK runner that invokes the agent once and prints the
-collected metrics in JSON format.
+The script connects to the specified remote machine over SSH, gathers system
+metrics and recent logs from any failed `systemd` services, then prints the
+results in JSON format.

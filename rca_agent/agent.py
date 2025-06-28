@@ -2,9 +2,36 @@ import json
 import os
 import resource
 import subprocess
-from typing import AsyncGenerator
+from typing import AsyncGenerator, Dict, List
 
+import paramiko
 import psutil
+
+
+class _SSHClient:
+    """Helper for running commands on a remote machine via SSH."""
+
+    def __init__(self, host: str, user: str, password: str | None = None, key: str | None = None):
+        self.host = host
+        self.user = user
+        self.password = password
+        self.key = key
+        self.client = paramiko.SSHClient()
+        self.client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+
+    def __enter__(self):
+        if self.key:
+            self.client.connect(self.host, username=self.user, key_filename=self.key)
+        else:
+            self.client.connect(self.host, username=self.user, password=self.password)
+        return self
+
+    def run(self, cmd: str) -> str:
+        stdin, stdout, stderr = self.client.exec_command(cmd)
+        return stdout.read().decode()
+
+    def __exit__(self, exc_type, exc, tb):
+        self.client.close()
 from google.adk.agents.base_agent import BaseAgent
 from google.adk.agents.invocation_context import InvocationContext
 from google.adk.events.event import Event
@@ -43,14 +70,70 @@ def _failed_services() -> list[str]:
         return [f'error: {exc}']
 
 
-def collect_metrics() -> dict:
+def _remote_memory_usage(client: _SSHClient) -> float:
+    out = client.run("free | awk '/Mem:/ {print ($3/$2)*100}'")
+    try:
+        return float(out.strip())
+    except Exception:
+        return 0.0
+
+
+def _remote_cpu_usage(client: _SSHClient) -> float:
+    cmd = "top -bn1 | grep 'Cpu(s)' | awk '{print 100 - $8}'"
+    out = client.run(cmd)
+    try:
+        return float(out.strip())
+    except Exception:
+        return 0.0
+
+
+def _remote_disk_usage(client: _SSHClient) -> float:
+    out = client.run("df -P / | tail -1 | awk '{print $5}'")
+    try:
+        return float(out.strip().strip('%'))
+    except Exception:
+        return 0.0
+
+
+def _remote_inode_usage(client: _SSHClient) -> float:
+    out = client.run("df -Pi / | tail -1 | awk '{print $5}'")
+    try:
+        return float(out.strip().strip('%'))
+    except Exception:
+        return 0.0
+
+
+def _remote_fd_usage(client: _SSHClient) -> float:
+    out = client.run('cat /proc/sys/fs/file-nr')
+    try:
+        alloc, _, max_files = [float(x) for x in out.split()[:3]]
+        return (alloc / max_files) * 100 if max_files > 0 else 0.0
+    except Exception:
+        return 0.0
+
+
+def _remote_failed_services(client: _SSHClient) -> List[str]:
+    out = client.run('systemctl --failed --no-legend --plain')
+    services = [line.split()[0] for line in out.strip().splitlines() if line]
+    return services
+
+
+def _remote_service_logs(client: _SSHClient, service: str) -> List[str]:
+    out = client.run(f'journalctl -u {service} --no-pager -n 20 2>/dev/null')
+    return out.strip().splitlines()
+
+
+def collect_metrics(client: _SSHClient) -> Dict[str, object]:
+    failed = _remote_failed_services(client)
+    logs = {srv: _remote_service_logs(client, srv) for srv in failed}
     return {
-        'memory_usage_percent': psutil.virtual_memory().percent,
-        'cpu_usage_percent': psutil.cpu_percent(interval=1.0),
-        'disk_usage_percent': psutil.disk_usage('/').percent,
-        'inode_usage_percent': _inode_usage('/'),
-        'fd_usage_percent': _fd_usage(),
-        'failed_systemd_services': _failed_services(),
+        'memory_usage_percent': _remote_memory_usage(client),
+        'cpu_usage_percent': _remote_cpu_usage(client),
+        'disk_usage_percent': _remote_disk_usage(client),
+        'inode_usage_percent': _remote_inode_usage(client),
+        'fd_usage_percent': _remote_fd_usage(client),
+        'failed_systemd_services': failed,
+        'systemd_logs': logs,
     }
 
 
@@ -63,7 +146,13 @@ class RCALinuxAgent(BaseAgent):
     async def _run_async_impl(
         self, ctx: InvocationContext
     ) -> AsyncGenerator[Event, None]:
-        metrics = collect_metrics()
+        host = os.environ.get('RCA_REMOTE_HOST', 'localhost')
+        user = os.environ.get('RCA_REMOTE_USER', 'root')
+        password = os.environ.get('RCA_REMOTE_PASSWORD')
+        key = os.environ.get('RCA_REMOTE_KEY')
+
+        with _SSHClient(host, user, password=password, key=key) as client:
+            metrics = collect_metrics(client)
         text = json.dumps(metrics, indent=2)
         yield Event(
             invocation_id=ctx.invocation_id,
