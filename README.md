@@ -14,7 +14,8 @@ failed `systemd` services.
    pip install google-adk psutil paramiko
    ```
 
-2. Set environment variables with the SSH connection information:
+2. (Optional) Set environment variables with SSH connection information to
+   collect metrics from another machine:
 
    * `RCA_REMOTE_HOST` - hostname or IP address of the target machine
    * `RCA_REMOTE_USER` - SSH username
@@ -27,6 +28,14 @@ failed `systemd` services.
    python run_rca_agent.py
    ```
 
-The script connects to the specified remote machine over SSH, gathers system
+If `RCA_REMOTE_HOST` is not set, metrics are collected from the local machine.
+When `RCA_REMOTE_HOST` is provided, the script connects over SSH to gather
 metrics and recent logs from any failed `systemd` services, then prints the
 results in JSON format.
+
+## Testing
+
+Running `make test` executes the unit tests. If the `lxc` command is available
+and the current user is permitted to create containers, the tests attempt to
+launch a temporary LXC container with an SSH server to verify remote metric
+collection. When LXC is unavailable, those tests are skipped.

@@ -70,6 +70,19 @@ def _failed_services() -> list[str]:
         return [f'error: {exc}']
 
 
+def _service_logs(service: str) -> List[str]:
+    """Return the last few lines of a systemd service's log."""
+    try:
+        output = subprocess.check_output(
+            ['journalctl', '-u', service, '--no-pager', '-n', '20'],
+            text=True,
+            stderr=subprocess.STDOUT,
+        )
+        return output.strip().splitlines()
+    except Exception:
+        return []
+
+
 def _remote_memory_usage(client: _SSHClient) -> float:
     out = client.run("free | awk '/Mem:/ {print ($3/$2)*100}'")
     try:
@@ -137,6 +150,21 @@ def collect_metrics(client: _SSHClient) -> Dict[str, object]:
     }
 
 
+def collect_local_metrics() -> Dict[str, object]:
+    """Collect metrics from the local machine."""
+    failed = _failed_services()
+    logs = {srv: _service_logs(srv) for srv in failed}
+    return {
+        'memory_usage_percent': psutil.virtual_memory().percent,
+        'cpu_usage_percent': psutil.cpu_percent(interval=0.1),
+        'disk_usage_percent': psutil.disk_usage('/').percent,
+        'inode_usage_percent': _inode_usage('/'),
+        'fd_usage_percent': _fd_usage(),
+        'failed_systemd_services': failed,
+        'systemd_logs': logs,
+    }
+
+
 class RCALinuxAgent(BaseAgent):
     """Simple agent to gather Linux metrics."""
 
@@ -146,13 +174,16 @@ class RCALinuxAgent(BaseAgent):
     async def _run_async_impl(
         self, ctx: InvocationContext
     ) -> AsyncGenerator[Event, None]:
-        host = os.environ.get('RCA_REMOTE_HOST', 'localhost')
-        user = os.environ.get('RCA_REMOTE_USER', 'root')
-        password = os.environ.get('RCA_REMOTE_PASSWORD')
-        key = os.environ.get('RCA_REMOTE_KEY')
+        host = os.environ.get('RCA_REMOTE_HOST')
+        if host:
+            user = os.environ.get('RCA_REMOTE_USER', 'root')
+            password = os.environ.get('RCA_REMOTE_PASSWORD')
+            key = os.environ.get('RCA_REMOTE_KEY')
 
-        with _SSHClient(host, user, password=password, key=key) as client:
-            metrics = collect_metrics(client)
+            with _SSHClient(host, user, password=password, key=key) as client:
+                metrics = collect_metrics(client)
+        else:
+            metrics = collect_local_metrics()
         text = json.dumps(metrics, indent=2)
         yield Event(
             invocation_id=ctx.invocation_id,
