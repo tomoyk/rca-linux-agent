@@ -21,8 +21,6 @@ A lightweight, zero-dependency Python tool for investigating Linux system issues
 - `log_analyzer.py`: Parses system logs and `dmesg` for suspicious patterns.
 - `diagnoser.py`: Contains the logic for identifying system health issues based on collected data.
 
-## Usage
-
 Simply run the main script with Python 3:
 
 ```bash
